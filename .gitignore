@@ -10,3 +10,5 @@
 *.log
 # local word list for scripts/check.sh
 .check-private
+# local Claude Code settings (e.g. a project-scope plugin install)
+.claude/

@@ -12,7 +12,6 @@ and say which.
 ## 1. Name and shape of the repo
 
 - Plugin name: `lookout`. Command: `/lookout`. Pane id: `lookout`. Pane title: `Lookout`.
-  (The user's other session still has a mod named `agent-watch` loaded; the name must differ.)
 - Repo root is the plugin folder (the marketplace file sits beside `plugin.json`).
 
 ```
@@ -390,8 +389,8 @@ A night sky over a hill with a domed observatory at the right.
 - `done`: belt stopped, lights low, the last crate with a ✓/✖ stamp.
 - Narrow: two tool arms only (shell, edit); mid: four; wide: six and the hopper.
 
-The user picks which of 6.3–6.6 to build (two or three). All four are specified so the pick
-costs nothing to restart.
+Two or three of 6.3–6.6 get built. All four are specified, so building another later costs no new
+design work.
 
 ## 7. Model-server adapters (`hooks/adapters.py`)
 
@@ -459,14 +458,13 @@ On non-terminal surfaces it is the same `Text` row. Below 60 columns it drops th
 1. **extract**: new name, paths out, config in, synthetic fixtures, adapters, green checks. Commit.
 2. **scenes**: activity model, scene engine, refined aurora and office, scene tests. Live in the
    pane. Commit.
-3. **more scenes**: the user picks from 6.3–6.6. Commit per scene.
+3. **more scenes**: chosen from 6.3–6.6. Commit per scene.
 4. **adoptable**: README (install, quickstart, config, scenes with screenshots, known limits).
    Commit.
 5. **publish**: marketplace file, secret scan, read-through, ask public/private + license, push.
 
-Working rules from the handoff: commits per milestone on a branch, no push before step 5 and a
-yes; the original mod folder and the other session are untouched; no dependencies beyond the
-runtime and stdlib Python.
+Commits per milestone; no dependencies beyond the runtime (and stdlib Python, until section 43.5
+removed it).
 
 ## 12. Demo mode
 

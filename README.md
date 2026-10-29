@@ -31,6 +31,9 @@ desktop app: **+** next to the prompt box → **Plugins** → **Add marketplace*
 You need Claude Code 2.1.312 or newer, and a terminal for the scenes. The desktop app, VS Code
 and mobile show the same pane as text.
 
+Every setting has a default, so the "options not yet set" note after installing needs nothing
+from you; [Configuration](docs/REFERENCE.md#configuration) lists them for when you want to change one.
+
 ## Try it
 
 | | |
