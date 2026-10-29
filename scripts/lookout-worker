@@ -1,0 +1,449 @@
+#!/bin/sh
+# lookout-worker: hand a task to a headless Claude Code worker on a local model server, logged
+# where the lookout pane looks (docs/DESIGN.md 43.4). POSIX sh; needs only `claude` and `curl`.
+#
+#   lookout-worker [--server ollama|llama.cpp|lmstudio|mlx-serve|vllm|URL] [--model NAME]
+#                  [--dir PROJECT] [--dry-run] ("the task" | -f task.md) [-- claude args...]
+#
+# It finds the model server (the default ports below, or `--server`), checks that it serves the
+# Anthropic Messages API (POST /v1/messages), picks the loaded model when `--model` is absent,
+# writes the task to logs/worker-current.handoff.md, and runs
+#
+#   claude -p --output-format stream-json --verbose ... < logs/worker-current.handoff.md
+#          > logs/worker-current.jsonl
+#
+# in PROJECT (default: the current directory), with every model role (main, small and fast,
+# subagents, the opus/sonnet/haiku/fable aliases) pointed at that one local model. A previous
+# worker-current.jsonl and its hand-off move to logs/worker-<timestamp>.* first, so no run is lost.
+# The pane follows ./logs/worker-current.jsonl on its own. `--dry-run` prints the environment and
+# the command instead of running anything.
+#
+# Default ports: llama.cpp and mlx-serve 8080, vLLM 8000, Ollama 11434, LM Studio 1234.
+# Models: Ollama the loaded one (/api/ps), else the first pulled (/api/tags), which it loads on the
+# first request; llama.cpp the one it serves (/v1/models); LM Studio only an already loaded one
+# (/api/v0/models: its /v1/models lists every downloaded model and would load a large one on
+# demand); vLLM and mlx-serve the first in /v1/models.
+#
+# Permissions. A worker under `claude -p` has nobody to answer a prompt, so anything that would
+# ask is denied (the pane counts the denials). The default is `--permission-mode acceptEdits`
+# (reads, edits and new files inside PROJECT, and the plain file commands such as mkdir, touch, mv
+# and rm there) plus an allowlist of the usual test, type check and read-only git commands, so the
+# worker can change code and check its work. Everything else that runs code or reaches out
+# (installs, scripts, curl, git commit and push) is denied. Change it with
+#   LOOKOUT_WORKER_ALLOW='Bash(make check *),Bash(git diff *)'   the allowlist (empty: none)
+#   -- --permission-mode auto | --dangerously-skip-permissions  anything after `--` goes to claude
+#                                                               last; a repeated flag wins
+#
+# Environment: LOOKOUT_WORKER_TOKEN (the bearer token sent to the server: `local` unless set, as
+# for a server started with an API key), CLAUDE (the claude binary), LOOKOUT_WORKER_URLS (space-separated
+# base URLs probed instead of the default ports; for tests). Your own ANTHROPIC_API_KEY and
+# Bedrock/Vertex/Foundry switches are left out of the worker's environment, so a key never goes to
+# the local server and the run never leaves your machine.
+set -u
+
+PROG=lookout-worker
+CLAUDE="${CLAUDE:-claude}"
+MIN_CTX=32768
+ALLOW_DEFAULT='Bash(npm test *),Bash(npm run test *),Bash(npx vitest *),Bash(npx jest *),Bash(npx tsc *),Bash(pnpm test *),Bash(yarn test *),Bash(bun test *),Bash(pytest *),Bash(python -m pytest *),Bash(python3 -m pytest *),Bash(go test *),Bash(go vet *),Bash(cargo test *),Bash(cargo check *),Bash(make test *),Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *)'
+
+usage() {
+  cat <<'EOF'
+usage: lookout-worker [--server NAME|URL] [--model NAME] [--dir PROJECT] [--dry-run]
+                      ("the task" | -f task.md) [-- claude args...]
+
+  --server   ollama, llama.cpp, lmstudio, mlx-serve, vllm, or a base URL (default: probe
+             ports 8080, 8000, 11434 and 1234 and take the first server that answers)
+  --model    the model name to ask for (default: the server's loaded model)
+  --dir      the project to work in (default: the current directory)
+  --dry-run  print the environment and the command instead of running them
+  -f FILE    read the task from FILE
+  --         pass the rest to claude, e.g. -- --max-turns 40 --permission-mode auto
+
+The task goes to logs/worker-current.handoff.md and the run to logs/worker-current.jsonl,
+which the lookout pane follows. Stop the worker with Ctrl-C.
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# ---------------------------------------------------------------------------------------------
+# Arguments
+
+SERVER="" MODEL="" DIR="" DRY=0 TASK="" TASK_FILE="" HAVE_TASK=0
+need() { [ $# -ge 2 ] || die "$1 needs a value (see --help)"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --server) need "$@"; SERVER="$2"; shift 2 ;;
+    --server=*) SERVER="${1#*=}"; shift ;;
+    --model) need "$@"; MODEL="$2"; shift 2 ;;
+    --model=*) MODEL="${1#*=}"; shift ;;
+    --dir) need "$@"; DIR="$2"; shift 2 ;;
+    --dir=*) DIR="${1#*=}"; shift ;;
+    --dry-run) DRY=1; shift ;;
+    -f|--file) need "$@"; TASK_FILE="$2"; HAVE_TASK=1; shift 2 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1 (see --help; claude's own flags go after --)" ;;
+    *) [ "$HAVE_TASK" = 0 ] || die "one task only: quote it (\"the task\") or use -f task.md"
+       TASK="$1"; HAVE_TASK=1; shift ;;
+  esac
+done
+# What is left in "$@" goes to claude as is.
+
+[ "$HAVE_TASK" = 1 ] || { usage >&2; exit 2; }
+if [ -n "$TASK_FILE" ]; then
+  [ -f "$TASK_FILE" ] || die "no such task file: $TASK_FILE"
+  [ -s "$TASK_FILE" ] || die "the task file is empty: $TASK_FILE"
+else
+  case "$TASK" in *[![:space:]]*) ;; *) die "the task is empty" ;; esac
+fi
+if [ -n "$DIR" ]; then
+  [ -d "$DIR" ] || die "no such project directory: $DIR"
+fi
+command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
+if [ "$DRY" = 0 ]; then
+  command -v "$CLAUDE" >/dev/null 2>&1 || die "claude is not on PATH (install Claude Code: https://claude.com/claude-code)"
+fi
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/lookout-worker.XXXXXX")" || die "cannot make a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 130' INT TERM
+
+# ---------------------------------------------------------------------------------------------
+# HTTP and JSON, without dependencies. The JSON readers are deliberately small: they take the
+# first value of a key from bodies these servers send, which are flat enough for that.
+
+# get URL: the body in $TMP/body, the status in $CODE (000 when nothing answers).
+get() {
+  : > "$TMP/body"
+  CODE="$(curl --noproxy '*' -s --connect-timeout 1 -m 4 -o "$TMP/body" -w '%{http_code}' "$1" 2>/dev/null)"
+  [ -n "$CODE" ] || CODE=000
+}
+body() { cat "$TMP/body"; }
+flat() { tr -d '\n\r'; }
+# str KEY: every string value of "KEY" on stdin, one per line.
+str() { flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed 's/^[^:]*:[[:space:]]*"//; s/"$//'; }
+# num KEY: the first number value of "KEY" on stdin.
+num() { flat | grep -o "\"$1\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" | head -n 1 | sed 's/.*[^0-9]//'; }
+has() { flat | grep -q "$1"; }
+
+trimurl() { printf '%s' "$1" | sed 's:/*$::'; }
+
+default_url() {
+  case "$1" in
+    ollama) echo http://127.0.0.1:11434 ;;
+    llama.cpp|mlx-serve) echo http://127.0.0.1:8080 ;;
+    lmstudio) echo http://127.0.0.1:1234 ;;
+    vllm) echo http://127.0.0.1:8000 ;;
+    *) return 1 ;;
+  esac
+}
+
+# identify URL: which server answers there, in $KIND (ollama, llama.cpp, lmstudio, vllm,
+# mlx-serve, other), or none. LM Studio answers 200 to any path, so each test looks for a key.
+identify() {
+  KIND=none
+  get "$1/v1/models"
+  if [ "$CODE" = 000 ]; then
+    get "$1/api/version"; [ "$CODE" = 000 ] && return 1
+  fi
+  if [ "$CODE" = 200 ] && body | has '"bytes_resident"'; then KIND=mlx-serve; return 0; fi
+  get "$1/api/version"
+  if [ "$CODE" = 200 ] && body | has '"version"'; then KIND=ollama; return 0; fi
+  get "$1/props"
+  if [ "$CODE" = 200 ] && body | has '"default_generation_settings"'; then KIND=llama.cpp; return 0; fi
+  get "$1/api/v0/models"
+  if [ "$CODE" = 200 ] && body | has '"state"'; then KIND=lmstudio; return 0; fi
+  get "$1/metrics"
+  if [ "$CODE" = 200 ] && body | has 'vllm:'; then KIND=vllm; return 0; fi
+  KIND=other
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# Is the server usable: does it speak the Messages API, and which model does it serve
+
+# api_ok URL: POST /v1/messages with an empty body is a request error where the route exists
+# (400, 422, or llama.cpp's 500) and a 404 where it does not (LM Studio: a 200 with "Unexpected
+# endpoint"). Nothing is generated.
+api_ok() {
+  : > "$TMP/body"
+  CODE="$(curl --noproxy '*' -s --connect-timeout 1 -m 6 -o "$TMP/body" -w '%{http_code}' -X POST \
+    -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{}' "$1/v1/messages" 2>/dev/null)"
+  [ -n "$CODE" ] || CODE=000
+  case "$CODE" in 000|404|405|501) return 1 ;; esac
+  ! body | has 'Unexpected endpoint'
+}
+
+# The pickers set PICK, CTX and NOTE for the server at $U, and add to WARNS.
+pick_ollama() {
+  get "$U/api/ps"
+  if [ "$CODE" = 200 ]; then
+    m="$(body | str name | head -n 1)"
+    if [ -n "$m" ]; then PICK="$m" CTX="$(body | num context_length)" NOTE=loaded; return; fi
+  fi
+  get "$U/api/tags"
+  [ "$CODE" = 200 ] || return
+  m="$(body | str name | grep -iv embed | head -n 1)"
+  [ -n "$m" ] && PICK="$m" NOTE="not loaded yet: Ollama loads it on the first request"
+}
+pick_lmstudio() {
+  get "$U/api/v0/models"
+  [ "$CODE" = 200 ] || return
+  line="$(body | flat | tr '}' '\n' | grep '"state"[[:space:]]*:[[:space:]]*"loaded"' |
+    grep -E '"type"[[:space:]]*:[[:space:]]*"(llm|vlm)"' | head -n 1)"
+  [ -n "$line" ] || return
+  PICK="$(printf '%s' "$line" | str id | head -n 1)"
+  CTX="$(printf '%s' "$line" | num loaded_context_length)"
+  NOTE=loaded
+}
+pick_llamacpp() {
+  get "$U/v1/models"
+  if [ "$CODE" = 200 ]; then
+    # One model, or a router's list: prefer an entry whose status is loaded.
+    entries="$(body | flat | awk '{ gsub(/"id"[ \t]*:/, "\n&"); print }' | grep '^"id"')"
+    e="$(printf '%s\n' "$entries" | grep '"value"[[:space:]]*:[[:space:]]*"loaded"' | head -n 1)"
+    [ -n "$e" ] || e="$(printf '%s\n' "$entries" | head -n 1)"
+    m="$(printf '%s' "$e" | str id | head -n 1)"
+    case "$m" in /*|*.gguf) m="$(basename "$m" .gguf)" ;; esac
+    [ -n "$m" ] && PICK="$m" NOTE=loaded
+  fi
+  get "$U/props"
+  if [ "$CODE" = 200 ]; then
+    CTX="$(body | num n_ctx)"
+    if body | has '"supports_tool_calls"[[:space:]]*:[[:space:]]*false'; then
+      WARNS="${WARNS}this model's chat template has no tool calls, and Claude Code works through tools: start llama-server with --jinja, or use a model whose template supports tools
+"
+    fi
+  fi
+}
+pick_v1() {
+  get "$U/v1/models"
+  [ "$CODE" = 200 ] || return
+  m="$(body | str id | head -n 1)"
+  [ -n "$m" ] || return
+  PICK="$m" NOTE=served
+  CTX="$(body | num max_model_len)"
+  [ -n "$CTX" ] || CTX="$(body | num context_length)"
+}
+
+# try U K: 0 when the server K at U can take the worker (PICK, CTX, NOTE, WARNS set); else 1
+# with the reason in ERR.
+try() {
+  U="$1" K="$2" PICK="" CTX="" NOTE="" WARNS="" ERR=""
+  if ! api_ok "$U"; then
+    ERR="$K at $U does not serve the Anthropic Messages API (POST /v1/messages answered $CODE).
+"
+    case "$K" in
+      ollama) ERR="${ERR}Update Ollama: newer versions serve /v1/messages (brew upgrade ollama, or ollama.com/download)." ;;
+      llama.cpp) ERR="${ERR}Update llama.cpp: newer llama-server builds serve /v1/messages (brew upgrade llama.cpp)." ;;
+      lmstudio) ERR="${ERR}Update LM Studio: recent versions serve /v1/messages (lms version shows yours)." ;;
+      vllm) ERR="${ERR}Update vLLM: newer versions serve /v1/messages (pip install -U vllm)." ;;
+      *) ERR="${ERR}Put an Anthropic-compatible proxy in front of it, e.g. LiteLLM (litellm --model openai/<model> --api_base $U/v1), and pass --server with the proxy's URL." ;;
+    esac
+    return 1
+  fi
+  case "$K" in
+    ollama) pick_ollama ;;
+    lmstudio) pick_lmstudio ;;
+    llama.cpp) pick_llamacpp ;;
+    *) pick_v1 ;;
+  esac
+  if [ -n "$MODEL" ]; then
+    # The server's context length belongs to the model it serves; a different one is unknown.
+    case "$K" in llama.cpp) ;; *) [ "$PICK" = "$MODEL" ] || CTX="" ;; esac
+    PICK="$MODEL" NOTE="as given"
+    return 0
+  fi
+  [ -n "$PICK" ] && return 0
+  ERR="$K at $U has no model loaded.
+"
+  case "$K" in
+    ollama) ERR="${ERR}Pull one (ollama pull <model>; ollama list shows yours), or pass --model." ;;
+    lmstudio) ERR="${ERR}Load one (lms load <model> --context-length 65536; lms ls lists what is downloaded), or pass --model." ;;
+    *) ERR="${ERR}Start the server with a model, or pass --model." ;;
+  esac
+  return 1
+}
+
+# ---------------------------------------------------------------------------------------------
+# Find the server
+
+how_to_start() {
+  cat >&2 <<'EOF'
+Start one, then run this again:
+  llama.cpp   llama-server -m model.gguf -c 65536 --jinja                  (port 8080)
+  Ollama      OLLAMA_CONTEXT_LENGTH=65536 ollama serve                      (port 11434)
+  LM Studio   lms server start; lms load <model> --context-length 65536     (port 1234)
+  vLLM        vllm serve <model>                                           (port 8000)
+  mlx-serve   mlx-serve --model <model>                                    (port 8080)
+Or name it: --server http://host:port
+EOF
+}
+
+URL="" KIND="" ALSO=""
+if [ -n "$SERVER" ]; then
+  case "$SERVER" in
+    http://*|https://*) u="$(trimurl "$SERVER")" ;;
+    *) u="$(default_url "$SERVER")" || die "unknown server '$SERVER': use ollama, llama.cpp, lmstudio, mlx-serve, vllm, or a URL" ;;
+  esac
+  if ! identify "$u"; then
+    printf '%s: nothing answers at %s\n' "$PROG" "$u" >&2
+    how_to_start; exit 1
+  fi
+  case "$SERVER" in
+    http://*|https://*) ;;
+    *) if [ "$KIND" = other ]; then KIND="$SERVER"
+       elif [ "$KIND" != "$SERVER" ]; then warn "$u answers as $KIND, not $SERVER; going on with $KIND"
+       fi ;;
+  esac
+  try "$u" "$KIND" || { printf '%s: %s\n' "$PROG" "$ERR" >&2; exit 1; }
+  URL="$u"
+else
+  # The first server that answers and can take the worker; the others are named in the summary.
+  tried="" first_err="" skipped=""
+  for u in ${LOOKOUT_WORKER_URLS:-http://127.0.0.1:8080 http://127.0.0.1:8000 http://127.0.0.1:11434 http://127.0.0.1:1234}; do
+    u="$(trimurl "$u")"
+    tried="$tried, $u"
+    identify "$u" || continue
+    if [ -n "$URL" ]; then ALSO="$ALSO, $KIND at $u"; continue; fi
+    if try "$u" "$KIND"; then
+      URL="$u" CHOSEN="$KIND" C_PICK="$PICK" C_CTX="$CTX" C_NOTE="$NOTE" C_WARNS="$WARNS"
+    else
+      [ -n "$first_err" ] || first_err="$ERR"
+      skipped="$skipped, $KIND at $u"
+    fi
+  done
+  if [ -z "$URL" ]; then
+    if [ -n "$first_err" ]; then printf '%s: %s\n' "$PROG" "$first_err" >&2; exit 1; fi
+    printf '%s: no model server found (tried %s)\n' "$PROG" "${tried#, }" >&2
+    how_to_start; exit 1
+  fi
+  KIND="$CHOSEN" PICK="$C_PICK" CTX="$C_CTX" NOTE="$C_NOTE" WARNS="$C_WARNS"
+  [ -z "$skipped" ] || WARNS="${WARNS}skipped ${skipped#, }: no Messages API or no model
+"
+fi
+MODEL="$PICK"
+ALSO="${ALSO#, }"
+
+case "$CTX" in ''|*[!0-9]*) CTX="" ;; esac
+if [ -n "$CTX" ] && [ "$CTX" -lt "$MIN_CTX" ]; then
+  WARNS="${WARNS}the model's context is $CTX tokens; Claude Code's own prompt and tools take about 20k, so give it $MIN_CTX or more (llama-server -c, lms load --context-length, OLLAMA_CONTEXT_LENGTH)
+"
+elif [ -z "$CTX" ] && [ "$KIND" = ollama ]; then
+  WARNS="${WARNS}Ollama's default context can be smaller than Claude Code's prompt: start it with OLLAMA_CONTEXT_LENGTH=65536 or more if replies come back cut short
+"
+fi
+printf '%s' "$WARNS" | while IFS= read -r w; do [ -n "$w" ] && warn "$w"; done
+
+# ---------------------------------------------------------------------------------------------
+# The worker's environment and command
+
+TOKEN="${LOOKOUT_WORKER_TOKEN:-local}"
+ENV_NAMES="ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL
+ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_FABLE_MODEL
+ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+API_TIMEOUT_MS"
+unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+ANTHROPIC_BASE_URL="$URL"
+ANTHROPIC_AUTH_TOKEN="$TOKEN"
+ANTHROPIC_MODEL="$MODEL"
+ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+ANTHROPIC_DEFAULT_FABLE_MODEL="$MODEL"
+ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# A local model can take minutes to read Claude Code's prompt the first time.
+API_TIMEOUT_MS="${API_TIMEOUT_MS:-1800000}"
+# The window Claude Code compacts against, when the server says how large it is.
+if [ -n "$CTX" ] && [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CTX"
+fi
+[ -n "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ] && ENV_NAMES="$ENV_NAMES CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+# shellcheck disable=SC2086
+export $ENV_NAMES
+
+ALLOW="${LOOKOUT_WORKER_ALLOW-$ALLOW_DEFAULT}"
+LOG=logs/worker-current.jsonl
+HANDOFF=logs/worker-current.handoff.md
+
+# claude's arguments, then the pass-through ones: append ours after "$@", then rotate the
+# pass-through ones round to the end. The allowlist goes first: --allowedTools takes every word
+# up to the next flag. Globbing is off while the rules (which hold `*`) are split on commas.
+pass_n=$#
+set -- "$@" -p
+if [ -n "$ALLOW" ]; then
+  set -- "$@" --allowedTools
+  set -f; OLDIFS="$IFS"; IFS=','
+  for r in $ALLOW; do [ -n "$r" ] && set -- "$@" "$r"; done
+  IFS="$OLDIFS"; set +f
+fi
+set -- "$@" --permission-mode acceptEdits --model "$MODEL" --output-format stream-json --verbose
+i=0
+while [ "$i" -lt "$pass_n" ]; do set -- "$@" "$1"; shift; i=$((i + 1)); done
+
+# Shell quoting for the printed command.
+q() {
+  case "$1" in
+    '' | *[!A-Za-z0-9_./:=@%+,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+if [ -n "$DIR" ]; then cd "$DIR" || die "cannot enter $DIR"; fi
+PROJECT="$(pwd)"
+
+if [ "$DRY" = 1 ]; then
+  printf '# lookout-worker --dry-run: %s at %s, model %s\n' "$KIND" "$URL" "$MODEL"
+  [ -z "$ALSO" ] || printf '# also running: %s (--server picks)\n' "$ALSO"
+  printf '# would write the task to %s and move an existing %s aside\n' "$HANDOFF" "$LOG"
+  printf 'cd %s\n' "$(q "$PROJECT")"
+  printf 'mkdir -p logs\n'
+  printf 'unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY\n'
+  for v in $ENV_NAMES; do eval "printf '%s=%s \\\\\n' \"\$v\" \"\$(q \"\$$v\")\""; done
+  printf '%s' "$(q "$CLAUDE")"
+  for a in "$@"; do printf ' %s' "$(q "$a")"; done
+  printf ' \\\n  < %s > %s\n' "$HANDOFF" "$LOG"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Hand off and run
+
+if [ -n "$TASK_FILE" ]; then
+  cp "$TASK_FILE" "$TMP/task" || die "cannot read $TASK_FILE"
+else
+  printf '%s\n' "$TASK" > "$TMP/task"
+fi
+mkdir -p logs || die "cannot make $PROJECT/logs"
+MOVED=""
+if [ -s "$LOG" ]; then
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dest="logs/worker-$stamp"
+  n=2
+  while [ -e "$dest.jsonl" ]; do dest="logs/worker-$stamp-$n"; n=$((n + 1)); done
+  mv "$LOG" "$dest.jsonl" || die "cannot move $LOG aside"
+  [ -f "$HANDOFF" ] && mv "$HANDOFF" "$dest.handoff.md"
+  MOVED="$dest.jsonl"
+fi
+cp "$TMP/task" "$HANDOFF" || die "cannot write $HANDOFF"
+first="$(grep '[^[:space:]]' "$HANDOFF" | head -n 1 | sed 's/^#* *//' | cut -c1-60)"
+
+printf 'lookout-worker\n'
+printf '  server  %s at %s\n' "$KIND" "$URL"
+printf '  model   %s%s\n' "$MODEL" "${NOTE:+ ($NOTE${CTX:+, context $CTX})}"
+printf '  task    %s ("%s")\n' "$HANDOFF" "$first"
+printf '  log     %s/%s%s\n' "$PROJECT" "$LOG" "${MOVED:+ (the last run is now $MOVED)}"
+printf '  watch   /lookout in Claude Code, in this project: the pane follows the log\n'
+printf '  stop    Ctrl-C, or kill %s\n' "$$"
+[ -z "$ALSO" ] || printf '  also    %s (--server picks)\n' "$ALSO"
+if [ "$URL" != http://127.0.0.1:8080 ]; then
+  printf '  rack    for decode speed and memory, set lookout'"'"'s serverUrl to %s\n' "$URL"
+fi
+
+trap - EXIT
+rm -rf "$TMP"
+exec "$CLAUDE" "$@" < "$HANDOFF" > "$LOG"

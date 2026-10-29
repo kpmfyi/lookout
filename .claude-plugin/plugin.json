@@ -1,0 +1,224 @@
+{
+  "name": "lookout",
+  "version": "1.0.0",
+  "description": "A little office beside your Claude Code session: what Claude is doing, drawn as an animated pixel scene over the plain facts (tools, diffs, tests, context, an API cost estimate). Follows this session, or a headless claude -p worker",
+  "author": {
+    "name": "kpmfyi"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/kpmfyi/lookout",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "log": {
+      "type": "string",
+      "title": "Log path",
+      "description": "Path of the stream-json log to follow (~ allowed; demo or session also work). Empty: LOOKOUT_LOG, then the first source, then ./logs/worker-current.jsonl when it exists, else this session",
+      "default": "",
+      "required": false
+    },
+    "sources": {
+      "type": "string",
+      "title": "Named sources",
+      "description": "Named logs, each name=path (e.g. local=~/logs/worker-current.jsonl); /lookout <name> switches. A single comma-separated string is read too",
+      "default": [],
+      "multiple": true,
+      "required": false
+    },
+    "scene": {
+      "type": "string",
+      "title": "Scene",
+      "description": "The animated scene at the top of the pane: office (the sidebar), office-hd (the same room at four times the density), or observatory (a quiet sky). controlroom and aurora were retired and read as office-hd and observatory",
+      "default": "office",
+      "options": [
+        "office",
+        "office-hd",
+        "observatory",
+        "controlroom",
+        "aurora"
+      ],
+      "required": false
+    },
+    "sceneSize": {
+      "type": "string",
+      "title": "Scene size",
+      "description": "How tall the scene is drawn: compact, standard, or large (for layouts that give the scene more room)",
+      "default": "standard",
+      "options": [
+        "compact",
+        "standard",
+        "large"
+      ],
+      "required": false
+    },
+    "palette": {
+      "type": "string",
+      "title": "Palette",
+      "description": "The colours the scenes and modules paint with: night (dark terminals, the default), paper (light terminals), or phosphor (a one-colour green CRT)",
+      "default": "night",
+      "options": [
+        "night",
+        "paper",
+        "phosphor"
+      ],
+      "required": false
+    },
+    "season": {
+      "type": "string",
+      "title": "Season",
+      "description": "What the office window shows: auto (follows the date), winter, spring, summer, autumn, or none (plain night sky)",
+      "default": "auto",
+      "options": [
+        "auto",
+        "winter",
+        "spring",
+        "summer",
+        "autumn",
+        "none"
+      ],
+      "required": false
+    },
+    "ambience": {
+      "type": "string",
+      "title": "Ambience",
+      "description": "Slow decorative loops in the scenes that mean nothing (rain on the glass, steam off a mug, a lamp breathing, the cat asleep): on (the default) or off (the scenes as they were drawn before)",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ],
+      "required": false
+    },
+    "layout": {
+      "type": "string",
+      "title": "Pane layout",
+      "description": "calm: the scene over what Claude is doing in plain words, its thinking and the run so far; detailed: the scene and a grid of instrument modules over every text block (on a wide pane the modules flank a large scene); ambient: the scene alone, filling the pane. classic, panel and wall were retired and read as detailed",
+      "default": "calm",
+      "options": [
+        "calm",
+        "detailed",
+        "ambient",
+        "classic",
+        "panel",
+        "wall"
+      ],
+      "required": false
+    },
+    "modules": {
+      "type": "string",
+      "title": "Modules",
+      "description": "Module ids for the detailed layout, in order (see README); unknown ids are skipped",
+      "default": [],
+      "multiple": true,
+      "required": false
+    },
+    "server": {
+      "type": "string",
+      "title": "Model server",
+      "description": "Model-server adapter; auto probes the URL and picks the first that answers",
+      "default": "auto",
+      "options": [
+        "auto",
+        "none",
+        "mlx-serve",
+        "llama.cpp",
+        "ollama",
+        "lmstudio",
+        "vllm"
+      ],
+      "required": false
+    },
+    "serverUrl": {
+      "type": "string",
+      "title": "Model server URL",
+      "description": "Base URL of the model server. Empty: each server's own default port (8080 llama.cpp and mlx-serve, 8000 vLLM, 11434 Ollama, 1234 LM Studio)",
+      "default": "",
+      "required": false
+    },
+    "serverLog": {
+      "type": "string",
+      "title": "Model server log",
+      "description": "Path of the model server's log file (mlx-serve reads per-request stats here)",
+      "default": "",
+      "required": false
+    },
+    "compare": {
+      "type": "string",
+      "title": "Compare cost against",
+      "description": "Which API model the cost estimate is priced at; off shows no money",
+      "default": "claude-sonnet-5-5",
+      "options": [
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        "custom",
+        "off"
+      ],
+      "required": false
+    },
+    "customPrices": {
+      "type": "string",
+      "title": "Custom prices",
+      "description": "in,out,cacheWrite,cacheRead in $/Mtok, used when compare is custom",
+      "default": "",
+      "required": false
+    },
+    "stallSecs": {
+      "type": "number",
+      "title": "Stall after (s)",
+      "description": "Seconds without log movement while waiting on the model before the pane says stalled",
+      "default": 180,
+      "required": false
+    },
+    "handoffFile": {
+      "type": "string",
+      "title": "Handoff file",
+      "description": "File whose first line the orchestrator strip shows as the task; empty: <log basename>.handoff.md beside the log",
+      "default": "",
+      "required": false
+    },
+    "background": {
+      "type": "string",
+      "title": "Scene background",
+      "description": "terminal: scenes leave their background unpainted so the terminal's own colour shows through; scene: scenes paint their own walls and floors",
+      "default": "terminal",
+      "options": [
+        "terminal",
+        "scene"
+      ],
+      "required": false
+    },
+    "tool": {
+      "type": "boolean",
+      "title": "Register the status tool",
+      "description": "Registers mcp__lookout__status so the orchestrating model can check the worker",
+      "default": true,
+      "required": false
+    },
+    "explain": {
+      "type": "string",
+      "title": "Thinking in plain words",
+      "description": "off (the default): the thinking stays on this machine, shown as its locally worked-out gist. session: also ask a small model (haiku, through this session's own API client) to say this session's thinking again in plain words. all: workers' thinking too, which then leaves the machine",
+      "default": "off",
+      "options": [
+        "off",
+        "session",
+        "all"
+      ],
+      "required": false
+    },
+    "notify": {
+      "type": "string",
+      "title": "Notifications",
+      "description": "Toasts and/or a status-line entry for failing tests, stalls and the run finishing",
+      "default": "toasts",
+      "options": [
+        "off",
+        "status",
+        "toasts",
+        "both"
+      ],
+      "required": false
+    }
+  }
+}

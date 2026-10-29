@@ -1,0 +1,12 @@
+{
+  "checked": "2026-10-28",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "unit": "USD per million tokens; cache_write is the 5-minute TTL rate",
+  "notes": "claude-haiku-5-5 has two rate cards by prompt length; the row below is the one for prompts of 100K tokens or fewer (longer prompts: in 0.50, out 2.50).",
+  "models": {
+    "claude-sonnet-5-5": { "in": 2.0, "out": 10.0, "cache_write": 2.5, "cache_read": 0.2 },
+    "claude-opus-5-5": { "in": 4.0, "out": 20.0, "cache_write": 5.0, "cache_read": 0.2 },
+    "claude-haiku-5-5": { "in": 0.1, "out": 0.5, "cache_write": 0.125, "cache_read": 0.01 },
+    "claude-fable-5-1": { "in": 10.0, "out": 50.0, "cache_write": 12.5, "cache_read": 0.25 }
+  }
+}

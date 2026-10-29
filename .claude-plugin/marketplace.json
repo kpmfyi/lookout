@@ -1,0 +1,13 @@
+{
+  "name": "lookout",
+  "description": "lookout: a little office beside your Claude Code session, drawn as an animated pixel scene",
+  "owner": {
+    "name": "kpmfyi"
+  },
+  "plugins": [
+    {
+      "name": "lookout",
+      "source": "./"
+    }
+  ]
+}

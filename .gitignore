@@ -1,0 +1,12 @@
+# written by the engine when the mod loads
+.claude-plugin/types/
+.mcpb-cache/
+# OS / editors
+.DS_Store
+*~
+*.swp
+# local runs
+/logs/
+*.log
+# local word list for scripts/check.sh
+.check-private
